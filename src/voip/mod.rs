@@ -55,7 +55,7 @@ pub(crate) use state::Voip;
 pub use audio::{AudioSink, AudioSource, EncodedAudioSink, EncodedAudioSource};
 pub use events::CallEvents;
 pub use facade::{
-    AcceptCall, CallHandle, CallLinkCall, CallTermination, GroupBoundCall, OutgoingCall,
+    AcceptCall, CallHandle, CallLinkCall, CallTermination, GroupBoundCall, JoinGroupCall, OutgoingCall,
     OutgoingGroupCall, VIDEO_UPGRADE_TIMEOUT,
 };
 pub use video::{TimedVideoFrame, VideoFrame, VideoSink, VideoSource};

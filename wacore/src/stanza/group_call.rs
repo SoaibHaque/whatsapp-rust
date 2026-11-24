@@ -93,6 +93,7 @@ pub fn build_active_group_accept(
     call_creator: &Jid,
     request_id: &str,
     video: bool,
+    capability: Option<&[u8]>,
 ) -> Result<Node> {
     validate_call_identity(call_id, request_id, call_creator)?;
     Ok(build_accept(&AcceptParams {
@@ -104,11 +105,27 @@ pub fn build_active_group_accept(
         relay_te: None,
         rte: None,
         voip_settings: None,
-        capability: None,
+        capability,
         video,
         peer_abtest_bucket: None,
         peer_abtest_bucket_id_list: None,
     }))
+}
+
+/// Build the `<lobby>` a client sends to a running group call it was not ringing for, before it
+/// accepts. Observed from WA Web's Join button: `<call to=CALL_ID@call><lobby call-id call-creator/>`.
+#[cold]
+pub fn build_active_group_lobby(call_id: &str, call_creator: &Jid, request_id: &str) -> Result<Node> {
+    validate_call_identity(call_id, request_id, call_creator)?;
+    let lobby = NodeBuilder::new("lobby")
+        .attr("call-id", call_id)
+        .attr("call-creator", call_creator)
+        .build();
+    Ok(NodeBuilder::new("call")
+        .attr("to", Jid::new(call_id, Server::Call))
+        .attr("id", request_id.to_string())
+        .children([lobby])
+        .build())
 }
 
 /// Build an initial group offer in the server-enforced child order.
@@ -1740,7 +1757,7 @@ mod tests {
             ["audio", "video", "encopt", "capability"]
         );
 
-        let accept = build_active_group_accept("ACTIVE-CALL", &creator, "ACCEPT-ID", true).unwrap();
+        let accept = build_active_group_accept("ACTIVE-CALL", &creator, "ACCEPT-ID", true, None).unwrap();
         assert_eq!(
             accept.as_node_ref().attrs().optional_jid("to").unwrap(),
             Jid::new("ACTIVE-CALL", Server::Call)
@@ -1754,6 +1771,33 @@ mod tests {
                 .as_node_ref()
                 .get_optional_child("metadata")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn active_group_lobby_matches_web_join() {
+        let creator = jid("111111111111111", 68);
+        let lobby = build_active_group_lobby("ACTIVE-CALL", &creator, "LOBBY-ID").unwrap();
+        let call = lobby.as_node_ref();
+        assert_eq!(call.tag, "call");
+        assert_eq!(
+            call.attrs().optional_jid("to").unwrap(),
+            Jid::new("ACTIVE-CALL", Server::Call)
+        );
+        // The captured payload is exactly these two attributes and no children.
+        let inner = action(&lobby).as_node_ref();
+        assert_eq!(inner.tag, "lobby");
+        let mut attrs = inner.attrs();
+        assert_eq!(attrs.optional_string("call-id").as_deref(), Some("ACTIVE-CALL"));
+        assert_eq!(attrs.optional_jid("call-creator"), Some(creator.clone()));
+        assert!(inner.children().is_none_or(|c| c.is_empty()));
+
+        let accept =
+            build_active_group_accept("ACTIVE-CALL", &creator, "ACCEPT-ID", false, Some(&[1, 5]))
+                .unwrap();
+        assert_eq!(
+            child_tags(action(&accept)),
+            ["audio", "net", "encopt", "capability"]
         );
     }
 

@@ -234,15 +234,28 @@ impl StanzaHandler for CallHandler {
                     // missed-call so a consumer can't auto-accept it (WA Web drops the stale notice
                     // rather than ringing; its cancel_call + missed_call for offerReceivedWhileOffline).
                     if let Some(timestamp) = call.timestamp {
-                        client
-                            .core
-                            .event_bus
-                            .dispatch(Event::MissedCall(MissedCall::new(
-                                call.from.clone(),
-                                call.action.call_id().to_string(),
-                                timestamp,
-                                MissedReason::Offline,
-                            )));
+                        let mut missed = MissedCall::new(
+                            call.from.clone(),
+                            call.action.call_id().to_string(),
+                            timestamp,
+                            MissedReason::Offline,
+                        );
+                        // A joinable group call can outlive our absence; WA Web offers Join for it.
+                        if let CallAction::Offer {
+                            call_creator,
+                            joinable: true,
+                            is_video,
+                            group_jid: Some(group_jid),
+                            ..
+                        } = &call.action
+                        {
+                            missed = missed.with_joinable(
+                                call_creator.clone(),
+                                group_jid.clone(),
+                                *is_video,
+                            );
+                        }
+                        client.core.event_bus.dispatch(Event::MissedCall(missed));
                     }
                 } else {
                     // Signal-only clients have no VoIP registry; keep the offer's

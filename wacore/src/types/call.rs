@@ -380,6 +380,18 @@ pub struct MissedCall {
     #[serde(with = "chrono::serde::ts_seconds")]
     pub timestamp: DateTime<Utc>,
     pub reason: MissedReason,
+    /// Set for a replayed group offer the server marked `joinable`: the call may still be running,
+    /// and `Voip::join_group_call` can enter it with this creator. `None` otherwise.
+    pub joinable: Option<JoinableGroupCall>,
+}
+
+/// What a replayed `joinable` group offer names, enough to join the call if it is still running.
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+pub struct JoinableGroupCall {
+    pub call_creator: Jid,
+    pub group_jid: Jid,
+    pub is_video: bool,
 }
 
 impl MissedCall {
@@ -391,7 +403,18 @@ impl MissedCall {
             call_id,
             timestamp,
             reason,
+            joinable: None,
         }
+    }
+
+    /// Mark a replayed offer as a group call that can still be joined.
+    pub fn with_joinable(mut self, call_creator: Jid, group_jid: Jid, is_video: bool) -> Self {
+        self.joinable = Some(JoinableGroupCall {
+            call_creator,
+            group_jid,
+            is_video,
+        });
+        self
     }
 }
 

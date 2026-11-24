@@ -23,7 +23,7 @@ use wacore::stanza::call::{
     build_video_state,
 };
 use wacore::stanza::group_call::{
-    GroupInviteOfferParams, InitialGroupOfferParams, build_group_invite_offer,
+    GroupInviteOfferParams, InitialGroupOfferParams, build_active_group_accept, build_active_group_lobby, build_group_invite_offer,
     build_initial_group_offer, parse_initial_group_call_ack,
 };
 use wacore::stats::UnkeyableDevice;
@@ -1392,6 +1392,160 @@ impl<'a> CallLinkCall<'a> {
         registration.disarm();
         teardown.disarm();
         Ok(handle)
+    }
+}
+
+/// Builder returned by [`Voip::join_group_call`](crate::Voip::join_group_call): enter a group call
+/// that is already running without a ringing offer for it, as WA Web's Join button does.
+///
+/// Sends `<lobby>` then `<accept>` to `CALL_ID@call`, waits for the call service's `group_update`
+/// carrying the roster and relay, and attaches group media. A requested rekey in that snapshot is
+/// answered by the ordinary group-update handler. Audio only.
+pub struct JoinGroupCall<'a> {
+    client: &'a Client,
+    call_id: &'a str,
+    call_creator: &'a Jid,
+    audio: Option<AudioEndpoints>,
+    video: Option<VideoEndpoints>,
+}
+
+impl<'a> JoinGroupCall<'a> {
+    pub(crate) fn new(client: &'a Client, call_id: &'a str, call_creator: &'a Jid) -> Self {
+        Self {
+            client,
+            call_id,
+            call_creator,
+            audio: None,
+            video: None,
+        }
+    }
+
+    impl_media_builder_methods!();
+
+    /// Join the call and return the handle that controls it.
+    pub async fn start(mut self) -> Result<CallHandle, CallError> {
+        let audio = self.audio.take().ok_or(CallError::MissingAudio)?;
+        if self.video.is_some() {
+            return Err(CallError::Media("joining a running group call is audio-only"));
+        }
+        if self.call_id.is_empty() {
+            return Err(CallError::EmptyCallId);
+        }
+        let mut audio_config = audio.config();
+        let plan = negotiated_audio_plan(
+            audio_config.format,
+            matches!(&audio, AudioEndpoints::Encoded { .. }),
+            None,
+        )?;
+        audio_config.format = plan.engine_format;
+        if plan.wire_format.signaling_rate != 16_000 {
+            // build_active_group_accept advertises 16 kHz only.
+            return Err(CallError::AudioFormatNotOffered(plan.wire_format.signaling_rate));
+        }
+        let own_lid = self.client.lid().ok_or(CallError::Media("no own LID"))?;
+        let registry = self.client.call_registry();
+        if registry.is_group_call(self.call_id) {
+            return Err(CallError::Media("already in this group call"));
+        }
+
+        let mut session = wacore::voip_control::CallSession::new_incoming(
+            self.call_id,
+            Jid::new(self.call_id, Server::Call),
+            self.call_creator.clone(),
+        );
+        session.audio_format = Some(plan.wire_format);
+        session.transition_to(CallPhase::Connecting);
+        // Registered before anything is sent, so the call service's snapshot finds this generation.
+        let mut registration = RegisteredCall::new_group(self.client, session).await;
+        registry.set_group_invite_self_device(
+            self.call_id,
+            registration.generation,
+            GroupCallDevice::new(own_lid.clone())
+                .with_capability(1, offer_capability(false, plan.wire_format)),
+        );
+        let mut teardown = AnswerTeardown::new(self.client, &registration);
+        teardown.arm();
+        registration.disarm();
+
+        let result = async {
+            let lobby = build_active_group_lobby(
+                self.call_id,
+                self.call_creator,
+                &self.client.generate_request_id(),
+            )
+            .map_err(|error| CallError::Response(error.to_string()))?;
+            send_answer_node(self.client, &registration, &mut teardown, lobby).await?;
+            let accept = build_active_group_accept(
+                self.call_id,
+                self.call_creator,
+                &self.client.generate_request_id(),
+                false,
+                // WA Web's join accept carries the device capability; members pick a codec from it.
+                Some(offer_capability(false, plan.wire_format)),
+            )
+            .map_err(|error| CallError::Response(error.to_string()))?;
+            send_answer_node(self.client, &registration, &mut teardown, accept).await?;
+            let update = match wacore::runtime::timeout(
+                &*self.client.runtime,
+                OFFER_ACK_RELAY_TIMEOUT,
+                wait_for_group_relay(&registry, self.call_id, registration.generation),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => return Err(CallError::ResponseTimeout),
+            };
+            let relay = update
+                .relay
+                .as_ref()
+                .ok_or(CallError::Media("group snapshot has no relay"))?;
+            let key = wacore::voip_control::MediaSessionKey::builder()
+                .call_id(self.call_id.to_string())
+                .generation(registration.generation)
+                .build();
+            let mut spec = wacore::voip_control::MediaSessionSpec::for_group(
+                CallDirection::Incoming,
+                key,
+                &own_lid.to_string(),
+                &self.call_creator.to_string(),
+                relay,
+            )
+            .map_err(|error| CallError::Setup(error.to_string()))?;
+            spec.audio = audio_config;
+            spec.group = Some(
+                crate::voip_control::MediaGroupSpec::builder()
+                    .call_creator(self.call_creator.clone())
+                    .self_jid(own_lid.clone())
+                    .initial_update(update.clone())
+                    .build(),
+            );
+            if !self.client.is_socket_connected() {
+                return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
+            }
+            registration.ensure_current()?;
+            open_registered_media(
+                self.client,
+                &registration,
+                spec,
+                audio,
+                None,
+                // The epoch arrives through the roster replay, as for an accepted group invite.
+                None,
+                plan.engine_switch,
+            )
+            .await
+        }
+        .await;
+        match result {
+            Ok(handle) => {
+                teardown.disarm();
+                Ok(handle)
+            }
+            Err(error) => {
+                teardown.terminate(self.client).await;
+                Err(error)
+            }
+        }
     }
 }
 

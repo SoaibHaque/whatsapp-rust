@@ -1228,6 +1228,17 @@ impl Voip<'_> {
         crate::voip::facade::GroupBoundCall::new(self.client, group_jid)
     }
 
+    /// Join a group call that is already running, by its id and creator: for example one named by
+    /// a replayed offer's `MissedCall::joinable`.
+    #[cfg(feature = "voip-control")]
+    pub fn join_group_call<'b>(
+        &'b self,
+        call_id: &'b str,
+        call_creator: &'b Jid,
+    ) -> crate::voip::JoinGroupCall<'b> {
+        crate::voip::facade::JoinGroupCall::new(self.client, call_id, call_creator)
+    }
+
     /// Join a reusable call link and attach group media after admission.
     #[cfg(feature = "voip-control")]
     pub fn call_link<'b>(
@@ -1310,6 +1321,7 @@ impl Voip<'_> {
             call_creator,
             &self.client.generate_request_id(),
             *is_video,
+            None,
         )
         .map_err(|error| CallError::Response(error.to_string()))?;
         self.client.send_node(node).await?;
